@@ -1,0 +1,67 @@
+name: Build & Deploy (Docker, Caddy)
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # Build happens inside the Dockerfile, but this ensures lockfiles are valid
+      - name: Docker login (GHCR)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build & tag image
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/zuma-frontend
+          SHORT_SHA=${GITHUB_SHA::7}
+          docker build -t $IMAGE:$SHORT_SHA -t $IMAGE:latest .
+
+      - name: Push image
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/zuma-frontend
+          SHORT_SHA=${GITHUB_SHA::7}
+          docker push $IMAGE:$SHORT_SHA
+          docker push $IMAGE:latest
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            APP_DIR=/opt/zuma
+            IMAGE=ghcr.io/${{ github.repository_owner }}/zuma-frontend
+            SHORT_SHA=${GITHUB_SHA::7}
+
+            # Update the tag atomically
+            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${SHORT_SHA}/" "$APP_DIR/.env"
+
+            # Pull new image and recreate only 'web'
+            cd "$APP_DIR"
+            docker login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+            docker compose pull web
+            docker compose up -d web
+
+            # Optionally prune old dangling images
+            docker image prune -f
